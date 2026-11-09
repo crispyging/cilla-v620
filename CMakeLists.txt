@@ -457,6 +457,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu)
     target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+
+    # The Engram's IQ4_NL row decode (src/ds4/ds4_iq4nl.cuh) against ggml's own reference: CPU only, no GPU, no model
+    add_executable(ds4_iq4nl_test tests/ds4_iq4nl_test.cu)
+    target_include_directories(ds4_iq4nl_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_iq4nl_test PRIVATE ${_strata_gpu_runtime_target} ggml-base)
+    add_test(NAME ds4_iq4nl_test COMMAND ds4_iq4nl_test)
   endif()
 
   if(STRATA_ENABLE_HIP)
@@ -1036,6 +1042,46 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT EXISTS "${_strata_mmq}/common.cuh" OR NOT EXISTS "${_strata_mmq}/quantize.cu")
       message(FATAL_ERROR "The selected GGML source is missing the ggml-cuda MMQ sources: ${_strata_mmq}")
     endif()
+    # Cilla: apply the CUDA branch's fused-SwiGLU MMQ patch on the HIP prompt path too (it applies
+    # cleanly to the pinned mmq.cuh). Delete this block to return to the separate SwiGLU kernel.
+    set(_cilla_mmq_glu OFF)
+    set(_cilla_mmq_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/mmq-fused-swiglu.patch)
+    set(_cilla_mmq_copy ${CMAKE_BINARY_DIR}/strata-ggml-cuda-hip)
+    find_package(Git)
+    if(GIT_FOUND AND EXISTS ${_cilla_mmq_patch})
+      file(REMOVE_RECURSE ${_cilla_mmq_copy})
+      file(COPY ${_strata_mmq}/ DESTINATION ${_cilla_mmq_copy})
+      execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}
+                              ${GIT_EXECUTABLE} apply --ignore-whitespace ${_cilla_mmq_patch}
+                      WORKING_DIRECTORY ${_cilla_mmq_copy} RESULT_VARIABLE _cilla_rc
+                      ERROR_VARIABLE _cilla_err)
+      if(_cilla_rc EQUAL 0)
+        set(_cilla_mmq_glu ON)
+        set(_strata_mmq ${_cilla_mmq_copy})
+        # Cilla: a negative stride_channel_x is a byte stride between experts (DeepSeek pack slots)
+        file(READ ${_cilla_mmq_copy}/mmq.cuh _cilla_m)
+        # Fail closed: the DS4 path depends on both of these exact pinned-source seams.
+        foreach(_cilla_required
+                "const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + "
+                "(x, x_gate, offset_x, ")
+          string(FIND "${_cilla_m}" "${_cilla_required}" _cilla_found)
+          if(_cilla_found EQUAL -1)
+            message(FATAL_ERROR "Cilla: incompatible MMQ source; required byte-stride patch seam missing. Use pinned llama.cpp.")
+          endif()
+        endforeach()
+        string(REPLACE "const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + "
+                       "const int ch_c = fastdiv(zt, channel_ratio); const char * x_ = stride_channel_x < 0 ? x + (int64_t) ch_c * (int64_t) (-stride_channel_x) : x; const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + (stride_channel_x < 0 ? 0 : ch_c*stride_channel_x) + "
+                       _cilla_m "${_cilla_m}")
+        string(REPLACE "(x, x_gate, offset_x, " "(x_, x_gate, offset_x, " _cilla_m "${_cilla_m}")
+        file(WRITE ${_cilla_mmq_copy}/mmq.cuh "${_cilla_m}")
+        message(STATUS "Cilla: MMQ byte-stride edit applied")
+        message(STATUS "Cilla: MMQ fused-SwiGLU patch applied for the HIP prompt path")
+      else()
+        message(FATAL_ERROR "Cilla: required MMQ fused-SwiGLU patch failed on HIP: ${_cilla_err}")
+      endif()
+    else()
+      message(FATAL_ERROR "Cilla: HIP MMQ requires Git and third_party/ggml/mmq-fused-swiglu.patch")
+    endif()
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
       src/prefill/moe_fused_rdna4.cu
@@ -1052,12 +1098,19 @@ if(STRATA_NATIVE_EXPERTS)
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    if(_cilla_mmq_glu)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
+    endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
 
     # Maya's GLM batched prompt path calls MMQ and BLAS directly, as on CUDA.
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+    if(TARGET maya-ds4 AND _cilla_mmq_glu)   # Cilla: the DS4 prompt path's experts through MMQ (DS4_MMQ=1)
+      target_link_libraries(maya-ds4 PRIVATE strata_mmq)
+      target_compile_definitions(maya-ds4 PRIVATE CILLA_DS4_MMQ=1)
+    endif()
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
     target_include_directories(hip_prefill_mmq_parity PRIVATE "${_strata_gg}/include")
@@ -1101,6 +1154,7 @@ if(STRATA_BUILD_TESTS)
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)

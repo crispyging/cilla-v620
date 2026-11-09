@@ -22,18 +22,20 @@ jobs:
           repository: ggml-org/llama.cpp
           ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
           path: third_party/llama.cpp
-          sparse-checkout: gguf-py
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
       # a venv, as installs run: maya.py started from a system Python hands itself to ./maya.sh (os.execve)
       - name: Python packages
         run: |
           python -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet -r requirements-test-cilla.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Server tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+      - name: DS4 packer tests
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools/ds4 -p "test_*.py"'

@@ -316,14 +316,66 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")
 
 
+def drafter_json_path(drafter_arg, model_parent):
+    """Which DSpark drafter .json the pack takes, or None for no drafter.
+
+    'none' opts out entirely — an artifact that ships no drafter must not pick up a sibling
+    model's (<model>/../dspark exists for Maya-S next to Mix-256G).  An explicit path must
+    exist; the default is taken only when its .json and .bin are both there."""
+    if drafter_arg == "none":
+        return None
+    d = pathlib.Path(drafter_arg).expanduser().resolve() if drafter_arg \
+        else pathlib.Path(model_parent) / "dspark" / "dspark.json"
+    if drafter_arg and not d.is_file():
+        raise SystemExit("%s: no drafter there" % d)
+    return d if (d.is_file() and d.with_suffix(".bin").is_file()) else None
+
+
+def vision_dir_path(vision_arg, model_parent):
+    """Which vision folder the pack takes, or None for no tower.  'none' opts out even when
+    a sibling model's ../vision is complete (same borrowing trap as the drafter)."""
+    if vision_arg == "none":
+        return None
+    v = pathlib.Path(vision_arg).expanduser().resolve() if vision_arg \
+        else pathlib.Path(model_parent) / "vision"
+    return v if ((v / "vision.json").is_file() and (v / "vision.bin").is_file()) else None
+
+
+QTYPE = {v[0]: (k, v[1], v[2]) for k, v in TYPES.items()}   # type name -> (ggml id, block, bytes)
+
+
+def resolve_override(name, e, nel):
+    """a blob-override manifest entry (off, bytes, qtype?, bin?) for a tensor of nel values:
+    its (type name, block, bytes) - the legacy mixq8.json (all Q8_0, no qtype) keeps resolving Q8_0."""
+    qt = e.get("qtype", "Q8_0")
+    t = QTYPE.get(qt)
+    if t is None:
+        raise SystemExit("%s: blob qtype %s is not a type the engine reads" % (name, qt))
+    if nel % t[1] or nel // t[1] * t[2] != int(e["bytes"]):
+        raise SystemExit("%s: %d bytes, %s of %d values is %d" % (name, e["bytes"], qt, nel, nel // t[1] * t[2]))
+    return qt, t[1], t[2]
+
+
+def expert_entries(ck, tname, fi2, base, nbytes, shape):
+    """[n_exp][out][in] -> an entry an expert: layers.N.ffn.experts.E.<role>.weight at base + e*part"""
+    n, part = shape[0], nbytes // shape[0]
+    pre, role = ck.rsplit(".", 1)
+    return [("%s.%d.%s.weight" % (pre, i, role), tname, fi2, base + i * part, part, shape[1:]) for i in range(n)]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
     ap.add_argument("--out", help="default: <model>/maya-ds4")
-    ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
-    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--vision", help="vision_pack.py's folder, or 'none' for no tower (default: <model>/../vision; "
+                                     "taken when it is there)")
+    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's), or 'none' for no drafter "
+                                      "(default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
+    ap.add_argument("--q8-dense", help="a folder with mixq8.bin + mixq8.json: dense tensors re-encoded as Q8_0 "
+                                       "(the engine's dense path takes F32/F16/BF16/Q8_0 only); those tensors are "
+                                       "then read from that blob instead of the GGUF shards")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
     a = ap.parse_args()
@@ -381,8 +433,24 @@ def main() -> int:
     rel = lambda p: os.path.relpath(p, model).replace(os.sep, "/")  # noqa: E731
     gs_all = gs + list(eg_from.values())
     names = [g.path.name for g in gs] + [rel(p) for p in eg_from]
+    # blob overrides (mixq8.json: name -> {off, bytes, qtype?, bin?}): tensors re-encoded into a side blob, so
+    # they are read from there instead of the GGUF shards - dense ones as Q8_0, expert stacks as whole-tensor MXFP4
+    # (each bin file becomes one more of the pack's files; the engine reads it like a shard)
+    q8d, q8d_fi = {}, {}
+    if a.q8_dense:
+        d = pathlib.Path(a.q8_dense).expanduser().resolve()
+        q8d = json.loads((d / "mixq8.json").read_text())
+        for e in q8d.values():
+            b = e.get("bin", "mixq8.bin")
+            if b not in q8d_fi:
+                if not (d / b).is_file():
+                    raise SystemExit("%s: no %s beside mixq8.json" % (d, b))
+                q8d_fi[b] = len(names)
+                names.append(rel(d / b))
+        print("blob overrides: %d tensors over %d files" % (len(q8d), len(q8d_fi)))
 
     tensors, unknown = [], []
+    used_q8d = set()
     for fi, g in enumerate(gs_all):
         for name, typ, dims, off in g.tensors:
             if typ not in TYPES:
@@ -404,6 +472,13 @@ def main() -> int:
                 continue
             shape = list(reversed(dims))     # ggml ne0 innermost -> torch order, outermost first
             base = g.data_start + off
+            fi2 = fi
+            if name in q8d:
+                # (a re-encoded blob tensor: the same mapping and splits, the blob's bytes and qtype, same shape)
+                e = q8d[name]
+                tname, _, _ = resolve_override(name, e, nel)
+                fi2, base, nbytes = q8d_fi[e.get("bin", "mixq8.bin")], int(e["off"]), int(e["bytes"])
+                used_q8d.add(name)
             if ck.endswith(".attn.wo_a.slice"):
                 # [o_groups * o_lora][in] -> o_groups entries of [o_lora][in] (group g: rows g * o_lora ..)
                 n = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
@@ -411,7 +486,7 @@ def main() -> int:
                     raise SystemExit("%s: %s %s does not split in %d groups" % (g.path.name, name, shape, n))
                 part = nbytes // n
                 for i in range(n):
-                    tensors.append(("%s.%d.weight" % (ck, i), tname, fi, base + i * part, part,
+                    tensors.append(("%s.%d.weight" % (ck, i), tname, fi2, base + i * part, part,
                                     [shape[0] // n, shape[1]]))
                 continue
             if ".ffn.experts." in ck:
@@ -419,20 +494,22 @@ def main() -> int:
                 n, part = shape[0], nbytes // shape[0]
                 pre, role = ck.rsplit(".", 1)
                 for i in range(n):
-                    tensors.append(("%s.%d.%s.weight" % (pre, i, role), tname, fi, base + i * part, part, shape[1:]))
+                    tensors.append(("%s.%d.%s.weight" % (pre, i, role), tname, fi2, base + i * part, part, shape[1:]))
                 continue
-            tensors.append((ck, tname, fi, base, nbytes, shape))
+            tensors.append((ck, tname, fi2, base, nbytes, shape))
     if unknown:
         raise SystemExit("tensors the pack does not map (%d): %s" % (len(unknown), ", ".join(unknown[:12])))
+    if q8d and len(used_q8d) != len(q8d):
+        # a stale manifest would silently leave half the model at a type the engine cannot read
+        raise SystemExit("q8-dense: %d of %d tensors never appeared in the shards (first: %s)"
+                         % (len(q8d) - len(used_q8d), len(q8d), sorted(set(q8d) - used_q8d)[:5]))
     # the DSpark drafter (drafter_pack.py's dspark.bin beside the quants' folders, from DeepSeek's checkpoint): its
     # three blocks as mtp.0-2, so the engine drafts with them
     files = names
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
-    drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
-    if a.drafter and not drafter.is_file():
-        raise SystemExit("%s: no drafter there" % drafter)
-    drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    drafter = drafter_json_path(a.drafter, model.parent)
+    drafter_in = drafter is not None
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
@@ -445,9 +522,9 @@ def main() -> int:
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
     # the vision tower (vision_pack.py's vision.bin, from DeepSeek's checkpoint): its tensors under the checkpoint's
     # names, the picture span's marker rows, and the geometry config.json gives them
-    vdir = pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision"
+    vdir = vision_dir_path(a.vision, model.parent)
     vision = {}
-    if (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
+    if vdir is not None:
         try:
             rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
         except ValueError:     # (Windows: another drive)

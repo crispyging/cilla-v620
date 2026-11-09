@@ -83,6 +83,9 @@ struct Stats {
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
 };
 
+/// Mutable, single-owner inference object. Public methods are not safe for concurrent external callers.
+/// Serialize request admission, conversation selection/switching, feed/step/checkpoint and teardown.
+/// Internal per-device worker threads do not make the public conversation API thread-safe.
 class Model {
 public:
     Model();
@@ -132,6 +135,22 @@ public:
     int vocab() const;
     int dim() const;
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
+    /// cilla: conversation slots (DS4_CONVS): make the slot that continues `ids` best the current one (none: the least
+    /// recently used, or an empty one) and return its index; with one slot, 0.
+    int pick_conversation(const std::vector<int>& ids);
+    int conversations() const;
+    /// cilla: lanes - several conversations decoded at once, pipelined over the layer split (0: none).
+    int lanes() const;
+    /// pick_conversation among the slots not busy (busy[i] != 0: a conversation in flight holds it); -1: none free.
+    int pick_conversation_free(const std::vector<int>& ids, const std::vector<char>& busy);
+    /// make slot c the current conversation (feed / sample / draft / verify then act on it).
+    void use_conversation(int c);
+    /// one decode step for each conversation conv[i]: it feeds tok[i]; its logits wait in lane i (sample_lane).
+    bool step_multi(const std::vector<int>& conv, const std::vector<int>& tok, std::string& err);
+    int sample_lane(int lane, int conv, float temperature, float top_p, int top_k, float min_p, uint64_t seed,
+                    uint64_t counter);
+    /// the position (tokens consumed) of conversation slot c.
+    int64_t conversation_pos(int c) const;
 
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);

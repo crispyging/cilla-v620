@@ -167,6 +167,18 @@ void Context::run(const Product& p, void* stream) {
     dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
 }
 
+void Context::run_bytes(const Product& p, void* stream) {
+    if (p.n <= 0 || p.max_rows <= 0) return;
+    const ggml_type t = (ggml_type) p.type;
+    const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+                        p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
+                        p.n, p.n, -(int64_t) p.expert_bytes, 0, 0,
+                        1, 1, 0, 0, 0,
+                        p.max_rows, p.max_rows};
+    dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
+}
+
 // STRATA_MMQ_GLU: the build compiles MMQ from a copy of ggml-cuda with third_party/ggml/mmq-fused-swiglu.patch
 bool glu_supported(int t, int64_t n_ff) {
 #if defined(STRATA_MMQ_GLU)

@@ -107,8 +107,13 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_q2_ple_and_large_tensors_stay_native(self):
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q2_0"))
-        for name in ["blk.0.ffn_gate_exps.weight", "token_embd.weight", "output.weight",
-                     "per_layer_token_embd.weight", "blk.0.attn_qkv.weight"]:
+        for name in [
+            "blk.0.ffn_gate_exps.weight",
+            "token_embd.weight",
+            "output.weight",
+            "per_layer_token_embd.weight",
+            "blk.0.attn_qkv.weight",
+        ]:
             self.assertFalse(iq_pack.needs_bf16(name, "IQ3_XXS"))
 
     def test_snapshot_symlinks_keep_split_discovery(self):

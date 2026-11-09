@@ -1,0 +1,12 @@
+# CPU-only Cilla release checks; the OpenAI SDK is a test oracle, not a server dependency.
+numpy==2.4.6
+jinja2==3.1.6
+regex==2026.11.9
+pyyaml==6.0.3
+tqdm==4.70.1
+psutil==7.2.2
+jsonschema==4.26.0
+openai==3.46.0
+cmake==4.4.4
+ninja==1.13.2
+pillow==13.0.0

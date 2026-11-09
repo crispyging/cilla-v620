@@ -163,6 +163,7 @@ struct SetArgs {
     int max_rows = 0;   // the most rows one expert of the set has
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    int total_rows = 0;   // (cilla: the set's rows, for the MMQ path; 0 = unknown)
 };
 /// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);

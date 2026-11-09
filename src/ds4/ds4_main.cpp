@@ -13,6 +13,28 @@
 #include "ds4_model.hpp"
 #include "strata/platform/env_alias.hpp"
 
+#include <csignal>
+#include <cstdlib>
+#include <execinfo.h>
+
+// ds4_fatal_backtrace: print the stack on a fatal signal before the default action runs
+static void ds4_fatal_backtrace(int sig) {
+    if (std::getenv("DS4_BT") != nullptr && std::atoi(std::getenv("DS4_BT")) == 0) {
+        std::signal(sig, SIG_DFL);
+        std::raise(sig);
+        return;
+    }
+    void* bt[64];
+    const int n = backtrace(bt, 64);
+    std::fprintf(stderr, "ds4: FATAL signal %d (%s) - backtrace, %d frames:\n", sig,
+                 sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : sig == SIGBUS ? "SIGBUS" : "?", n);
+    backtrace_symbols_fd(bt, n, 2);
+    std::fflush(stderr);
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -23,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <set>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -90,6 +113,23 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
+    std::atomic<bool> pause{false};   // (cilla: PAUSE - end the answer where the state holds what it wrote)
+    std::set<long long> stop_rid, pause_rid;   // (cilla: STOP <rid> / PAUSE <rid>, the multi protocol)
+    bool take(std::set<long long>& s, long long rid) {
+        std::lock_guard<std::mutex> lk(mu);
+        return s.erase(rid) > 0;
+    }
+    bool try_next(std::string& l) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        l = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool ended() {
+        std::lock_guard<std::mutex> lk(mu);
+        return eof && q.empty();
+    }
     void start() {
         std::thread([this] {
             std::string l, buf;
@@ -122,6 +162,12 @@ struct Lines {
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
                     stop.store(true);
+                    if (l.size() > 5) stop_rid.insert(std::atoll(l.c_str() + 5));
+                    continue;
+                }
+                if (l == "PAUSE" || l.rfind("PAUSE ", 0) == 0) {   // (cilla: the server's fair slices)
+                    pause.store(true);
+                    if (l.size() > 6) pause_rid.insert(std::atoll(l.c_str() + 6));
                     continue;
                 }
                 if (l == "QUIT") stop.store(true);
@@ -158,12 +204,26 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
     return pp;
 }
 
+// The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the
+// chance that it and every draft before it are kept stays at least this - a long window whose later drafts are likely
+// lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F (STRATA_DS4_DSPARK_CUM), a request's dspark_cum key; 0: off.
+// 0.5 by default (upstream measured +6.5% decode on a Radeon 8065S, the same tokens).
+float dspark_cum_default() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        // (cilla: upstream's 0.5 measured 54.6 vs 62.9 tok/s here - the drafter's 0.5 floor already cuts the
+        // long windows on this box, and the product then rejects drafts that would have been kept)
+        return e != nullptr ? (float) std::atof(e) : 0.0f;
+    }();
+    return v;
+}
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err) {
+           int& accepted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
     if (spec && room > 1 && m.draft_block() > 0) {
@@ -171,7 +231,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         std::vector<float> conf;
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
         int keep = 0;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
+        if (cum_min < 0) cum_min = dspark_cum_default();
+        float cum = 1.0f;
+        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+               (cum *= conf[(size_t) keep]) >= cum_min)
+            ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
@@ -196,12 +260,14 @@ struct Req {
     unsigned long long seed = 0;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
     // (-1: the whole context, which the engine caps at its window; 0: none)
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
+    long long rid = -1;   // (cilla: the multi protocol's request id)
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -295,10 +361,12 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "rid") r.rid = std::atoll(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -306,7 +374,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
-    std::printf("READY %lld stop\n", (long long) m.max_context());
+    std::printf("READY %lld stop pause\n", (long long) m.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
     Lines in;
@@ -314,6 +382,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::string line;
     unsigned long long counter = 0;
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
+    // cilla: per conversation slot - its pictures, and whether its last answer ended at a PAUSE (the next request that
+    // continues it by exactly the paused token is that answer's next slice: it keeps the slot's checkpoints)
+    std::vector<std::vector<Pic>> held_by((size_t) m.conversations());
+    std::vector<char> paused_by((size_t) m.conversations(), 0);
+    int conv = 0;
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
     const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
@@ -334,6 +407,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         in.stop.store(false);
+        in.pause.store(false);
         Req r;
         if (!parse_gen(line, r, geni)) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
@@ -357,6 +431,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 continue;
             }
         }
+        {   // cilla: the slot this prompt continues best
+            held_by[(size_t) conv] = std::move(held);
+            conv = m.pick_conversation(r.ids);
+            held = std::move(held_by[(size_t) conv]);
+        }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
         size_t c = 0;
@@ -378,6 +457,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             from = (size_t) m.pos();
         else m.reset();
         if (from == 0) held.clear();
+        // (a paused answer's next slice: prompt + what it wrote, the state one token short of it)
+        const bool resume = paused_by[(size_t) conv] && from == n_state && r.ids.size() == n_state + 1;
+        paused_by[(size_t) conv] = 0;
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
                         r.max_new, (long long) m.max_context());
@@ -435,7 +517,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
-            if (fin && last_window) {
+            if (fin && resume) {   // (cilla: keeps the checkpoints at the answer's prompt for the chat's next turn)
+                ok = m.feed(r.ids.data() + done, (int) n, 1, err);
+            } else if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
                 if (ok) m.checkpoint(1);
                 ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
@@ -462,7 +546,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         held = std::move(pics);
-        m.checkpoint(0);
+        if (!resume) m.checkpoint(0);
         const double t1 = now_ms();
         long long produced = 0;
         const char* finish = "length";
@@ -538,6 +622,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             if (produced >= limit || m.pos() >= m.max_context()) break;
+            if (got.empty() && in.pause.load()) {   // (cilla: the state holds all it wrote but this last token)
+                finish = "cancel";
+                paused_by[(size_t) conv] = 1;
+                break;
+            }
             if (got.empty()) {   // the next round: the drafts (if any) and the token after them
                 const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
                 int off = 0, acc = 0;
@@ -546,7 +635,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err)) {
+                           off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -576,6 +665,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
+        {   // cilla: this answer's decode alone - the VRAM hit, CPU-lane / streamed experts a token, DS4_PROF's stages
+            const double fed = (double) std::max<int64_t>(1, s.tokens - s_dec.tokens);
+            const double ex = (double) (s.experts - s_dec.experts), cx = (double) (s.cpu_experts - s_dec.cpu_experts),
+                         sx = (double) (s.stream_experts - s_dec.stream_experts);
+            std::fprintf(stderr, "cilla decode: %lld tokens fed %.0f, experts %.1f a fed token, vram_hit %.4f, cpu %.2f, "
+                                 "streamed %.2f, swaps %.2f a fed token\n", produced, fed, ex / fed,
+                         ex > 0 ? 1.0 - (cx + sx) / ex : 1.0, cx / fed, sx / fed, (double) (s.swaps - s_dec.swaps) / fed);
+            if (s.prof_tokens > s_dec.prof_tokens) {
+                const double pt = (double) (s.prof_tokens - s_dec.prof_tokens);
+                double sum = 0;
+                for (int i = 0; i < 6; ++i) sum += (s.prof_ms[i] - s_dec.prof_ms[i]) / pt;
+                std::fprintf(stderr, "cilla decode GPU per window (%.0f windows): %.2f ms - between layers %.2f, attention %.2f, "
+                                     "routing + shared %.2f, experts gate/up %.2f, wait CPU lane %.2f, down + post %.2f\n",
+                             pt, sum, (s.prof_ms[0] - s_dec.prof_ms[0]) / pt, (s.prof_ms[1] - s_dec.prof_ms[1]) / pt,
+                             (s.prof_ms[2] - s_dec.prof_ms[2]) / pt, (s.prof_ms[3] - s_dec.prof_ms[3]) / pt,
+                             (s.prof_ms[4] - s_dec.prof_ms[4]) / pt, (s.prof_ms[5] - s_dec.prof_ms[5]) / pt);
+            }
+        }
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
         m.save_profile();
@@ -584,9 +691,326 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     return 0;
 }
 
+
+// ---- cilla: several conversations at once (READY ... multi=<lanes>): requests tagged rid=<id>, their lines T / PP /
+// DONE / ERR <rid> ...; a prompt is read alone (the chunked path takes every GPU), then the conversations decode
+// together - each step one window per conversation, pipelined over the layer split (Model::step_multi). A conversation
+// alone decodes as before, with the drafter. Each holds one of the engine's conversation slots while it is in flight.
+int serve_multi(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
+    std::vector<int> eos = parse_ids(eos_list);
+    const int N = m.lanes();
+    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("READY %lld stop pause multi=%d\n", (long long) m.max_context(), N);
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya ds4 serve: %d conversations at once (cilla lanes); GEN/GENI with rid=<id>, STOP/PAUSE <id>\n", N);
+    Lines in;
+    in.start();
+    const int NC = m.conversations();
+    std::vector<std::vector<Pic>> held_by((size_t) NC);
+    std::vector<char> paused_by((size_t) NC, 0), busy((size_t) NC, 0);
+    SpanCache spans;
+    const int img_tok = m.image_token();
+    struct Act {
+        Req r;
+        int conv = 0, tok = -1;
+        long long produced = 0, limit = 0, d_off = 0, d_acc = 0;
+        unsigned long long counter = 0;
+        double t0 = 0, t1 = 0;
+        size_t from = 0;
+        bool cool = false, seeded = true, done = false;
+        const char* finish = "length";
+    };
+    std::vector<Act> act;
+    std::deque<std::string> pending;
+    unsigned long long counter0 = 0;
+    auto is_eos = [&](int t) {
+        for (int e : eos)
+            if (t == e) return true;
+        return false;
+    };
+    auto pen = [&](const Req& r) {
+        m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
+                        std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
+                        std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+    };
+    auto end_act = [&](Act& a) {
+        const double t2 = now_ms();
+        std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", a.r.rid, a.produced, a.r.ids.size(),
+                    a.t1 - a.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.from);
+        std::fflush(stdout);
+        std::fprintf(stderr,
+                     "maya ds4 serve: [rid %lld conv %d] prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
+                     "%lld generated in %.0f ms (%.2f tok/s)\n",
+                     a.r.rid, a.conv, a.r.ids.size(), a.from, a.r.ids.size() - a.from, a.t1 - a.t0,
+                     a.t1 > a.t0 ? 1000.0 * (double) (a.r.ids.size() - a.from) / (a.t1 - a.t0) : 0.0, a.produced,
+                     t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0);
+        busy[(size_t) a.conv] = 0;
+        a.done = true;
+    };
+    // token t written by a (the state holds everything before it): T line, then whether a ends here
+    auto emit = [&](Act& a, int t, bool last_of_round) {
+        std::printf("T %lld %d\n", a.r.rid, t);
+        ++a.produced;
+        a.tok = t;
+        if (in.take(in.stop_rid, a.r.rid)) {
+            a.finish = "cancel";
+            return true;
+        }
+        if (is_eos(t)) {
+            a.finish = "stop";
+            return true;
+        }
+        if (a.produced >= a.limit || m.conversation_pos(a.conv) + 1 >= m.max_context()) {
+            a.finish = "length";
+            return true;
+        }
+        if (last_of_round && in.take(in.pause_rid, a.r.rid)) {   // (the state holds all it wrote but this last token)
+            a.finish = "cancel";
+            paused_by[(size_t) a.conv] = 1;
+            return true;
+        }
+        return false;
+    };
+    // a request's prompt, read alone; then its first token
+    auto admit = [&](const std::string& line) {
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        Act a;
+        Req& r = a.r;
+        if (!parse_gen(line, r, geni)) {
+            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
+            std::fflush(stdout);
+            return;
+        }
+        const long long rid = r.rid;
+        auto fail = [&](const std::string& e) {
+            std::printf("ERR %lld %s\n", rid, e.c_str());
+            std::printf("DONE %lld 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", rid, r.ids.size());
+            std::fflush(stdout);
+        };
+        m.begin_request();
+        a.t0 = now_ms();
+        std::vector<Pic> pics;
+        {
+            std::string e;
+            if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
+            else if (geni && read_pics(r.file, pics, e))
+                for (const Pic& q : pics)
+                    if (q.start < 0 || (size_t) q.start >= r.ids.size() || r.ids[(size_t) q.start] != img_tok)
+                        e = "a picture's span does not start at an image token of the prompt";
+            if (!e.empty()) return fail(e);
+        }
+        if (r.ids.empty()) return fail("an empty prompt");
+        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context())
+            return fail("the prompt (" + std::to_string(r.ids.size()) + " tokens) and max_new " + std::to_string(r.max_new) +
+                        " are more than the context " + std::to_string(m.max_context()));
+        a.conv = m.pick_conversation_free(r.ids, busy);
+        if (a.conv < 0) {
+            std::string busy_n;
+            for (size_t i = 0; i < busy.size(); ++i) busy_n += busy[i] ? "1" : "0";
+            return fail("no free conversation slot (" + std::to_string(busy.size()) + " slots, busy " + busy_n + ")");
+        }
+        std::vector<Pic>& held = held_by[(size_t) a.conv];
+        const auto& st = m.tokens();
+        const size_t n_state = st.size();
+        size_t c = 0;
+        while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+        auto same = [](const std::vector<Pic>& v, const Pic& q) {
+            for (const Pic& x : v)
+                if (x.start == q.start && x.hash == q.hash) return true;
+            return false;
+        };
+        for (const Pic& q : pics)
+            if ((size_t) q.start < c && !same(held, q)) c = (size_t) q.start;
+        for (const Pic& q : held)
+            if ((size_t) q.start < c && !same(pics, q)) c = (size_t) q.start;
+        size_t from = 0;
+        if (c == n_state && n_state < r.ids.size()) from = n_state;
+        else if (m.restorable((int64_t) std::min(c, r.ids.size() - 1)) >= 0 &&
+                 m.restore((int64_t) std::min(c, r.ids.size() - 1)))
+            from = (size_t) m.pos();
+        else m.reset();
+        if (from == 0) held.clear();
+        const bool resume = paused_by[(size_t) a.conv] && from == n_state && r.ids.size() == n_state + 1;
+        paused_by[(size_t) a.conv] = 0;
+        std::string err;
+        bool ok = true;
+        if (!pics.empty()) {
+            std::vector<strata::ds4::Image> imgs;
+            for (Pic& q : pics) {
+                for (const Pic& x : held)
+                    if (x.start == q.start && x.hash == q.hash) q.len = x.len;
+                if (q.len > 0 && (size_t) q.start + q.len <= from) continue;
+                std::shared_ptr<const std::vector<uint16_t>> rows = spans.get(m, q, err);
+                if (!rows) {
+                    ok = false;
+                    break;
+                }
+                q.len = rows->size() / (size_t) m.dim();
+                bool fits = (size_t) q.start + q.len <= r.ids.size() - 1;
+                for (size_t i = 0; fits && i < q.len; ++i) fits = r.ids[(size_t) q.start + i] == img_tok;
+                if (!fits) {
+                    err = "a picture's span is not a run of image tokens in the prompt";
+                    ok = false;
+                    break;
+                }
+                imgs.push_back({q.start, rows});
+            }
+            if (ok) m.set_images(std::move(imgs));
+            for (Pic& q : pics) q.rgb = {};
+        }
+        const size_t total = r.ids.size();
+        size_t done = from, next_pp = from + 64;
+        const double t0 = a.t0;
+        m.set_progress([&](int64_t d) {
+            const double ms = now_ms() - t0;
+            std::printf("PP %lld %zu %zu %.1f %.1f %zu\n", rid, done + (size_t) d, total, ms,
+                        ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
+            std::fflush(stdout);
+        });
+        while (ok && done < total) {
+            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            const bool fin = done + n == total;
+            if (fin && resume) ok = m.feed(r.ids.data() + done, (int) n, 1, err);
+            else ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err) : m.feed(r.ids.data() + done, (int) n, 0, err);
+            done += n;
+            if (ok && (done >= next_pp || done == total)) {
+                const double ms = now_ms() - t0;
+                std::printf("PP %lld %zu %zu %.1f %.1f %zu\n", rid, done, total, ms,
+                            ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
+                std::fflush(stdout);
+                next_pp = done + 64;
+            }
+        }
+        m.set_progress(nullptr);
+        m.set_images({});
+        if (!ok) {
+            std::fprintf(stderr, "ds4: %s\n", err.c_str());
+            m.reset();
+            held.clear();
+            return fail(err);
+        }
+        held = std::move(pics);
+        if (!resume) m.checkpoint(0);
+        a.t1 = now_ms();
+        a.from = from;
+        a.limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
+        a.counter = counter0;
+        counter0 += 1ull << 32;
+        busy[(size_t) a.conv] = 1;
+        pen(r);
+        const int t = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, a.counter++);
+        if (emit(a, t, true)) end_act(a);
+        else act.push_back(std::move(a));
+        std::fflush(stdout);
+    };
+    for (;;) {
+        // the requests that came in (waiting for one when nothing is in flight)
+        std::string line;
+        bool quit = false;
+        if (act.empty() && pending.empty()) {
+            if (!in.next(line)) break;
+            if (line == "QUIT") break;
+            pending.push_back(line);
+        }
+        while (in.try_next(line)) {
+            if (line == "QUIT") {
+                quit = true;
+                break;
+            }
+            if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
+                std::printf("ERR unsupported command '%s'\n", line.substr(0, line.find(' ')).c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            pending.push_back(line);
+        }
+        if (quit) break;
+        if (!pending.empty()) {   // (the busy slots follow from the requests in flight, not from a counter that can drift)
+            std::fill(busy.begin(), busy.end(), 0);
+            for (const Act& a : act) busy[(size_t) a.conv] = 1;
+        }
+        while (!pending.empty() && (int) act.size() < N) {
+            const std::string l = pending.front();
+            pending.pop_front();
+            admit(l);
+            std::fill(busy.begin(), busy.end(), 0);
+            for (const Act& a : act) busy[(size_t) a.conv] = 1;
+        }
+        // a STOP / PAUSE for a conversation in flight between its steps
+        for (Act& a : act) {
+            if (in.take(in.stop_rid, a.r.rid)) {
+                a.finish = "cancel";
+                end_act(a);
+            } else if (in.take(in.pause_rid, a.r.rid)) {
+                a.finish = "cancel";
+                paused_by[(size_t) a.conv] = 1;
+                end_act(a);
+            }
+        }
+        act.erase(std::remove_if(act.begin(), act.end(), [](const Act& a) { return a.done; }), act.end());
+        if (act.empty()) continue;
+        std::string err;
+        if (act.size() == 1) {   // alone: a round with the drafter, as the single-conversation serve
+            Act& a = act[0];
+            m.use_conversation(a.conv);
+            pen(a.r);
+            const Req& r = a.r;
+            const int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
+            int off = 0, acc = 0;
+            const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !a.cool && a.seeded;
+            std::vector<int> got;
+            if (!round(m, a.tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
+                       r.min_p, r.seed, a.counter, got, off, acc, err, r.cum)) {
+                std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                a.finish = "cancel";
+                end_act(a);
+            } else {
+                a.d_off += off;
+                a.d_acc += acc;
+                a.cool = try_spec && off == 0;
+                a.seeded = true;   // (the round fed the trunk: the drafter is seeded from this conversation)
+                for (size_t i = 0; i < got.size(); ++i)
+                    if (emit(a, got[i], i + 1 == got.size())) {
+                        end_act(a);
+                        break;
+                    }
+            }
+        } else {   // together: one window each, pipelined
+            std::vector<int> cv, tk;
+            for (const Act& a : act) {
+                cv.push_back(a.conv);
+                tk.push_back(a.tok);
+            }
+            if (!m.step_multi(cv, tk, err)) {
+                std::fprintf(stderr, "ds4: step_multi: %s\n", err.c_str());
+                for (Act& a : act) {
+                    std::printf("ERR %lld %s\n", a.r.rid, err.c_str());
+                    a.finish = "cancel";
+                    end_act(a);
+                }
+            } else
+                for (size_t i = 0; i < act.size(); ++i) {
+                    Act& a = act[i];
+                    a.seeded = false;   // (the drafter's taps are another conversation's now: a plain step first)
+                    pen(a.r);
+                    const int t = m.sample_lane((int) i, a.conv, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p,
+                                                a.r.seed, a.counter++);
+                    if (emit(a, t, true)) end_act(a);
+                }
+        }
+        std::fflush(stdout);
+        act.erase(std::remove_if(act.begin(), act.end(), [](const Act& a) { return a.done; }), act.end());
+    }
+    m.save_profile();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::signal(SIGSEGV, ds4_fatal_backtrace);
+    std::signal(SIGABRT, ds4_fatal_backtrace);
+    std::signal(SIGBUS, ds4_fatal_backtrace);
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
@@ -610,6 +1034,8 @@ int main(int argc, char** argv) {
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
         } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
+        // cilla: DS4_MMQ=1 allocates each device's MMQ scratch outside the expert pool, so keep that room free
+        // (otherwise a pool filled to the reserve leaves too little and the engine's own scratch allocations fail)
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
@@ -661,6 +1087,9 @@ int main(int argc, char** argv) {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    if (std::getenv("DS4_MMQ") && std::atoi(std::getenv("DS4_MMQ")) != 0)
+        o.reserve_mib += 320;   // (cilla: room for the MMQ path's per-device scratch - 8192 rows of gate/up/down
+                                 // scratch + the q8 activations, ~200 MB - outside the expert pool)
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -668,7 +1097,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (serve_mode) {   // (cilla: DS4_MULTI=0 keeps the one-at-a-time serve with lanes loaded)
+        const char* mv = std::getenv("DS4_MULTI");
+        if (m.lanes() > 1 && (mv == nullptr || std::atoi(mv) != 0)) return serve_multi(m, eos, spec, o.dspark_conf);
+        return serve(m, eos, spec, o.dspark_conf);
+    }
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
         std::vector<uint8_t> px((size_t) std::max(0, enc_w) * std::max(0, enc_h) * 3);

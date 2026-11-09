@@ -174,12 +174,12 @@ void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, 
 
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  q6k: the rows are
 /// ggml Q6_K superblocks instead (hd / 256 of them, 210 bytes each, at the start of each row's hd bytes; no scales),
-/// decoded as ggml's dequantize_row_q6_K.
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k = false);
+
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int mode = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
 /// T tokens -> out F32 [T * cols][hd].
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
-                        bool q6k = false);
+                        int mode = 0);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]
 /// (kv[t] = [key hc x dim | value dim]).
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s);
@@ -203,7 +203,7 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 /// The mailboxes of a small window (decode, a draft's verification, the drafter's block): host-mapped memory, a ring of
 /// kRing.  The device publishes a layer's routing and its FFN inputs for the window's T tokens (seq written last, after
 /// a system fence); the host answers with the CPU lane's weighted part of each token that took a CPU-lane expert.
-constexpr int kRing = 64;
+constexpr int kRing = 256;   // (cilla: was 64 - several windows in flight with the lanes)
 constexpr int kMaxDim = 8192;
 constexpr int kAhead1 = 16, kAhead = kAhead1 + kPicks;   // a token's guesses for the next layer, then the one after
 struct Req {

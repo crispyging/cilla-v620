@@ -32,9 +32,13 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    if (!bench && !c::cpu_features().usable()) {
+        std::fprintf(stderr, "SKIP expert_multi_test: %s\n", c::cpu_features().reason());
+        return 77;  // CTest hardware skip, never a parity pass.
+    }
     c::cpu_require_expert_support();
     std::mt19937 rng(9);
-    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const int E = bench ? (argc > 2 ? std::atoi(argv[2]) : 256) : 4;
     std::vector<uint8_t> blobs((size_t) E * c::BLOB);
     for (int e = 0; e < E; ++e) make_blob(&blobs[(size_t) e * c::BLOB], rng);

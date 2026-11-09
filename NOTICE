@@ -1,0 +1,17 @@
+Cilla is a derivative of Project Maya (https://github.com/mw00/project-maya), itself derived from Strata (https://github.com/Niko1221/Strata).
+
+The following notices are retained and govern their respective components:
+
+- Main engine/server: LICENSE (MIT; Project Maya and Strata contributors).
+- ggml/llama.cpp formats, CPU kernels and MMQ integration: third_party/ggml/LICENSE (MIT).
+- EXL3 format/kernels: third_party/exllamav3/LICENSE (MIT).
+- beellama.cpp-derived DFlash2 code: third_party/beellama.cpp/LICENSE (MIT).
+- DeepSeek-derived components: LICENSE.deepseek-v41 (MIT).
+- Outfit web fonts: serve/web/fonts/OFL.txt (SIL Open Font License 1.1).
+- Vendored Python wheels: original licenses are embedded within each wheel's dist-info/licenses directory or dist-info/LICENSE; additional plugin notices remain inside their packages. See third_party/wheels/.
+
+The original source snapshot's bundled fixtures, wheels, screenshots and fonts were byte-compared with the public Project Maya base revision. They are inherited upstream assets, not private deployment captures or model weights from a user's machine. Synthetic fixtures are test inputs, not runnable full models.
+
+Optional model downloads are not included. They keep their own licenses; notably the optional GLM DFlash2 drafter is described upstream as CC BY-NC-ND 4.0 and is not licensed by this repository's MIT source license.
+
+Cilla's public snapshot omits private deployment history and metadata. Original upstream author/license credits remain intact. The name references a New World game character; no ownership of the character, artwork or trademark is claimed, and no game artwork is included. This project is unaffiliated with Amazon Games.

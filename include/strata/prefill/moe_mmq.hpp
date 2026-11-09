@@ -63,6 +63,9 @@ public:
     /// the plain product's values through a SwiGLU kernel built without fast math, bit for bit.  Only where
     /// glu_supported(p.type, n_ff).
     void run_glu(const Product& p, float limit, void* stream);
+    /// cilla: as run, but p.expert_bytes is any byte stride (not a whole number of blocks) - the experts of a
+    /// DeepSeek pack's slots, each blob holding gate, up and down (needs the build's byte-stride mmq.cuh edit)
+    void run_bytes(const Product& p, void* stream);
 
 private:
     void* ctx_ = nullptr;

@@ -3,6 +3,9 @@
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
+#if defined(CILLA_DS4_MMQ)
+#include "mmq_scratch_alloc.hpp"
+#endif
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -16,6 +19,9 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#if defined(CILLA_DS4_MMQ)
+#include "strata/prefill/moe_mmq.hpp"
+#endif
 
 namespace strata::ds4::gguf {
 namespace {
@@ -1413,9 +1419,142 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
 }
 }  // namespace
 
+#if defined(CILLA_DS4_MMQ)
+// cilla: DS4_MMQ=1 - a prompt set's low-bit experts through llama.cpp's int8 MMQ (gfx1030: dp4a), where the HIP build
+// otherwise runs set_kernel's FP32 tiles; gate and up as two products, the clamped SwiGLU, then down
+namespace {
+namespace mq = strata::prefill::mmq;
+struct MmqScratch {
+    void* xq = nullptr;
+    size_t xq_cap = 0;
+    float* g = nullptr;
+    float* u = nullptr;
+    size_t gu_cap = 0;   // floats each
+    int* bnd = nullptr;
+    int* iota = nullptr;
+    int iota_cap = 0;
+    size_t rows_cap = 0;
+    mq::Context* ctx = nullptr;
+};
+std::mutex g_mq_mu;
+std::unordered_map<int, MmqScratch> g_mq;
+int mmq_mode() {
+    static const int m = std::getenv("DS4_MMQ") ? std::atoi(std::getenv("DS4_MMQ")) : 0;
+    return m;
+}
+void mmq_mark_served() {
+    // (set by the model's first request: from then on the scratch must not grow)
+}
+int mmq_min_rows() {
+    static const int m = std::getenv("DS4_MMQ_MIN") ? std::atoi(std::getenv("DS4_MMQ_MIN")) : 16;
+    return m;
+}
+__global__ void cilla_rel_bounds(const int* __restrict__ b, int n1, int row0, int* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n1) out[i] = b[i] - row0;
+}
+__global__ void cilla_iota(int* __restrict__ d, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = i;
+}
+__global__ void cilla_swiglu_h16(const float* __restrict__ g, const float* __restrict__ u, int rows, int ff, float limit,
+                                 uint16_t* __restrict__ h, int ldh) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * ff) return;
+    const int r = (int) (i / ff), c = (int) (i % ff);
+    float gv = g[i], uv = u[i];
+    if (limit > 0.0f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(__fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv)));
+}
+__global__ void cilla_h16_f32(const uint16_t* __restrict__ h, int ldh, int rows, int ff, float* __restrict__ o) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * ff) return;
+    const int r = (int) (i / ff), c = (int) (i % ff);
+    o[i] = __half2float(__ushort_as_half(h[(size_t) r * ldh + c]));
+}
+MmqScratch* mmq_scratch(int rows, int kmax, int ff, int nexp, cudaStream_t s) {
+    // The 320 MiB CLI reservation covers this tuned geometry and its fixed 8192-row buffers.
+    // Other geometries remain on the existing generic expert path.
+    if (rows <= 0 || rows > 8192 || kmax <= 0 || kmax > 5120 || ff <= 0 || ff > 2304 ||
+        nexp <= 0 || nexp > 1023) return nullptr;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lk(g_mq_mu);
+    MmqScratch& m = g_mq[dev];
+    if (m.ctx == nullptr) m.ctx = new mq::Context();
+    // cilla: sized once for the largest set (DS4_MMQ_SET_ROWS, up to 8192): growing it mid-prompt reallocates with
+    // kernels in flight, which hangs the engine. The VRAM for it is reserved (see ds4_main.cpp).
+    static std::atomic<bool> served{false};
+    if (served.load() && rows > (int) m.rows_cap && m.rows_cap > 0)
+        std::fprintf(stderr, "cilla mmq: the scratch must grow to %d rows mid-run (cap %zu)\n", rows, m.rows_cap);
+    // Fixed reservation is for at most 8192 rows; larger requests must use generic path.
+    if (rows > 8192) return nullptr;
+    rows = std::max(rows, 8192);
+    const size_t xq = mq::q8_bytes(rows, kmax), gu = (size_t) rows * ff;
+    auto alloc = [](void** p, size_t n) { return cudaMalloc(p, n) == cudaSuccess; };
+    auto release = [](void* p) { cudaFree(p); };
+    if (!cilla::mmq_scratch::replace(m.xq, m.xq_cap, xq, alloc, release)) return nullptr;
+    if (!cilla::mmq_scratch::replace_pair(m.g, m.u, m.gu_cap, gu, gu * sizeof(float), alloc, release)) return nullptr;
+    if (m.bnd == nullptr && cudaMalloc(&m.bnd, 1024 * 4) != cudaSuccess) return nullptr;
+    if (m.iota_cap < rows) {
+        void* ids = m.iota;
+        size_t ids_cap = (size_t) m.iota_cap * sizeof(int);
+        if (!cilla::mmq_scratch::replace(ids, ids_cap, (size_t) rows * sizeof(int), alloc, release)) return nullptr;
+        m.iota = static_cast<int*>(ids);
+        m.iota_cap = (int) (ids_cap / sizeof(int));
+        cilla_iota<<<(rows + 255) / 256, 256, 0, s>>>(m.iota, rows);   // (on the caller's stream: no device sync)
+    }
+    m.rows_cap = (size_t)rows;
+    (void) nexp;
+    return &m;
+}
+bool mmq_ok(const x3::SetArgs& sa) {
+    if (!mmq_mode() || sa.total_rows <= 0 || sa.total_rows > 8192 || sa.max_rows <= mmq_min_rows() ||
+        sa.n_exp <= 0 || sa.n_exp > 1023 || sa.n_embd <= 0 || sa.n_embd > 5120 ||
+        sa.n_ff <= 0 || sa.n_ff > 2304) return false;
+    const int tg = expert_type(sa.lay, 0), tu = expert_type(sa.lay, 1), td = expert_type(sa.lay, 2);
+    return tg == tu && mq::supported(tg) && mq::supported(td);
+}
+}  // namespace
+#endif
+
 void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
+#if defined(CILLA_DS4_MMQ)
+    if (!mx_experts(sa.lay) && mmq_ok(sa)) {
+        const int R = sa.total_rows, FF = sa.n_ff, D = sa.n_embd, tg = expert_type(sa.lay, 0);
+        if (MmqScratch* m = mmq_scratch(R, std::max(D, FF), FF, sa.n_exp, s)) {
+            cilla_rel_bounds<<<(sa.n_exp + 1 + 255) / 256, 256, 0, s>>>(sa.bounds, sa.n_exp + 1, sa.row0, m->bnd);
+            mq::quantize(x, row_idx, m->xq, tg, D, ldx, R, s);
+            mq::Product p;
+            p.type = tg;
+            p.w_rows = FF;
+            p.w_cols = D;
+            p.expert_bytes = sa.stride;
+            p.n = sa.n_exp;
+            p.xq = m->xq;
+            p.bounds = m->bnd;
+            p.ids = m->iota;
+            p.total_rows = R;
+            p.max_rows = sa.max_rows;
+            p.ld_dst = FF;
+            p.w = sa.wbase + sa.lay.trellis[0];
+            p.dst = m->g;
+            m->ctx->run_bytes(p, s);
+            p.w = sa.wbase + sa.lay.trellis[1];
+            p.dst = m->u;
+            m->ctx->run_bytes(p, s);
+            const size_t ne = (size_t) R * FF;
+            cilla_swiglu_h16<<<(unsigned) ((ne + 255) / 256), 256, 0, s>>>(m->g, m->u, R, FF, sa.limit, h16, ldh);
+            check("set_gate_up (mmq)");
+            return;
+        }
+    }
+#endif
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;
@@ -1477,6 +1616,34 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
 
 void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
+#if defined(CILLA_DS4_MMQ)
+    if (!mx_experts(sa.lay) && mmq_ok(sa)) {
+        const int R = sa.total_rows, FF = sa.n_ff, D = sa.n_embd, td = expert_type(sa.lay, 2);
+        if (MmqScratch* m = mmq_scratch(R, std::max(D, FF), FF, sa.n_exp, s)) {
+            cilla_rel_bounds<<<(sa.n_exp + 1 + 255) / 256, 256, 0, s>>>(sa.bounds, sa.n_exp + 1, sa.row0, m->bnd);
+            const size_t ne = (size_t) R * FF;
+            cilla_h16_f32<<<(unsigned) ((ne + 255) / 256), 256, 0, s>>>(h16, ldh, R, FF, m->g);
+            mq::quantize(m->g, nullptr, m->xq, td, FF, FF, R, s);
+            mq::Product p;
+            p.type = td;
+            p.w_rows = D;
+            p.w_cols = FF;
+            p.expert_bytes = sa.stride;
+            p.n = sa.n_exp;
+            p.xq = m->xq;
+            p.bounds = m->bnd;
+            p.ids = m->iota;
+            p.total_rows = R;
+            p.max_rows = sa.max_rows;
+            p.ld_dst = ldy;
+            p.w = sa.wbase + sa.lay.trellis[2];
+            p.dst = y;
+            m->ctx->run_bytes(p, s);
+            check("set_down (mmq)");
+            return;
+        }
+    }
+#endif
     if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;

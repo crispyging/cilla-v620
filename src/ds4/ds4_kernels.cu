@@ -3,6 +3,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
+#include "ds4_iq4nl.cuh"
 
 #include <cuda_fp16.h>
 
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::ds4 {
 namespace {
@@ -941,7 +943,10 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
 }
 
-template <int G>
+// Optional LDS layout: physical column = c XOR (((c >> 6) & 1) * 8).
+// Swaps adjacent aligned uint4s in every other 64-value band, spreading dot-product
+// vector reads over all LDS banks. No changed arithmetic or global cache layout.
+template <int G, bool Swizzle = false>
 __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const float* __restrict__ q,
                                                                       const uint16_t* __restrict__ win,
                                                                       const uint8_t* __restrict__ ckv,
@@ -985,15 +990,14 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
         if (sr >= n) return;
         const int j = s0 + sr;
         uint4* dst = (uint4*) (tile + sr * d + part * 32);
-        if (t0 + j < n_win) {   // a window row: BF16 already
+        const int sw = Swizzle ? ((part >> 1) & 1) : 0;
+        uint4 v[4];
+        if (t0 + j < n_win) {
             const uint4* src = (const uint4*) (rows[j] + part * 64);
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst[3] = src[3];
-            return;
-        }
-        unpack32(rows[j], part, dst);
+            v[0] = src[0]; v[1] = src[1]; v[2] = src[2]; v[3] = src[3];
+        } else unpack32(rows[j], part, v);
+        dst[0 ^ sw] = v[0]; dst[1 ^ sw] = v[1];
+        dst[2 ^ sw] = v[2]; dst[3 ^ sw] = v[3];
     };
     const int total = n_win + n_sel;
     for (int t0 = 0; t0 < total; t0 += kAttTile) {
@@ -1011,9 +1015,9 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
 #pragma unroll 2
 #endif
             for (int r = wr; r < n; r += W) {   // (two rows' chains at once)
-                const uint16_t* vr = tile + r * d + lane * 16;
-                const uint4 a = *(const uint4*) vr;
-                const uint4 b = *(const uint4*) (vr + 8);
+                const int col = lane * 16;
+                const uint4 a = *(const uint4*) (tile + r * d + (col ^ (Swizzle ? (((col >> 6) & 1) * 8) : 0)));
+                const uint4 b = *(const uint4*) (tile + r * d + ((col + 8) ^ (Swizzle ? (((col >> 6) & 1) * 8) : 0)));
                 const uint16_t* pa = (const uint16_t*) &a;
                 const uint16_t* pb = (const uint16_t*) &b;
                 float s = 0.0f;
@@ -1059,7 +1063,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
             stage(t0, s0, n);
             __syncthreads();
             for (int r = 0; r < n; ++r) {
-                const uint32_t pr = *(const uint32_t*) (tile + r * d + c);
+                const uint32_t pr = *(const uint32_t*) (tile + r * d + (c ^ (Swizzle ? (((c >> 6) & 1) * 8) : 0)));
                 const float v0 = bf16f((uint16_t) (pr & 0xffffu)), v1 = bf16f((uint16_t) (pr >> 16));
 #pragma unroll
                 for (int g = 0; g < G; ++g) {
@@ -1267,11 +1271,17 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
 
 // ---------------------------------------------------------------- engram
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
-                                      float* __restrict__ out, bool q6k) {
+                                      float* __restrict__ out, int mode) {
     const int r = blockIdx.x;
-    if (q6k) {   // (ggml Q6_K superblocks at the row's start)
+    if (mode == 1) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) r * hd + (size_t) (e / 256) * kQ6kBytes, e % 256);
+        return;
+    }
+    if (mode == 2) {   // (ggml IQ4_NL blocks at the row's start: 18 bytes a 32 values, its own scale inside)
+        for (int e = threadIdx.x; e < hd; e += blockDim.x)
+            out[(size_t) r * hd + e] =
+                iq4nl_value(rows + (size_t) r * hd + (size_t) (e / kIq4nlBlock) * kIq4nlBytes, e % kIq4nlBlock);
         return;
     }
     for (int e = threadIdx.x; e < hd; e += blockDim.x) {
@@ -1679,13 +1689,19 @@ __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __r
 }
 
 __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_t per, int cols, int hd,
-                                          float* __restrict__ out, bool q6k) {
+                                          float* __restrict__ out, int mode) {
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
-    if (q6k) {   // (ggml Q6_K superblocks at the row's start)
+    if (mode == 1) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) (e / 256) * kQ6kBytes, e % 256);
+        return;
+    }
+    if (mode == 2) {   // (ggml IQ4_NL blocks at the row's start)
+        for (int e = threadIdx.x; e < hd; e += blockDim.x)
+            out[(size_t) r * hd + e] =
+                iq4nl_value(rows + (size_t) (e / kIq4nlBlock) * kIq4nlBytes, e % kIq4nlBlock);
         return;
     }
     for (int e = threadIdx.x; e < hd; e += blockDim.x) {
@@ -1816,8 +1832,8 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
 }
-void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, bool q6k) {
-    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, q6k);
+void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int mode) {
+    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, mode);
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s) {
@@ -1951,10 +1967,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % G != 0) G = 1;
     const dim3 grid(heads / G, T);
     const uint8_t* c = (const uint8_t*) ckv;
-    if (G == 8) sparse_attn_packed_kernel<8><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else sparse_attn_packed_kernel<1><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    static const bool swizzle = [] { const char* e = std::getenv("DS4_ATTN_SWIZZLE"); return e && std::atoi(e) != 0; }();
+    auto launch = [&]<bool Swizzle>() {
+    if (G == 8) sparse_attn_packed_kernel<8, Swizzle><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 4) sparse_attn_packed_kernel<4, Swizzle><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 2) sparse_attn_packed_kernel<2, Swizzle><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else sparse_attn_packed_kernel<1, Swizzle><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    };
+    if (swizzle) launch.template operator()<true>();
+    else launch.template operator()<false>();
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
@@ -1998,8 +2019,8 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
     confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
 }
 
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k) {
-    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, q6k);
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int mode) {
+    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, mode);
 }
 
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s) {
