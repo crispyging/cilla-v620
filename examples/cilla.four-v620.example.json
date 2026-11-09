@@ -1,0 +1,37 @@
+{
+  "exe": "/path/to/cilla/build-v620/maya-ds4",
+  "cwd": "/path/to/cilla",
+  "log": "/path/to/cilla/cilla-engine.log",
+  "args": [
+    "--pack", "/path/to/model-pack",
+    "--gpus", "0,1,2,3",
+    "--max-context", "524288",
+    "--reserve-mib", "256",
+    "--prefill-chunk", "4096",
+    "--vision", "on",
+    "--mmap-experts", "off",
+    "--dspark", "on"
+  ],
+  "tokenizer": "/path/to/model-pack/tokenizer",
+  "model_name": "cilla-deepseek-v4.1",
+  "thinking_budget": 4096,
+  "backend": "hip",
+  "gpu": [0, 1, 2, 3],
+  "host": "127.0.0.1",
+  "env": {
+    "DS4_SPLIT": "5,5,5,6,4,5,5,5",
+    "DS4_GEMM16": "1",
+    "DS4_W16_MB": "32",
+    "DS4_ATTN_A": "1024",
+    "DS4_BULK_CHUNK": "4096",
+    "DS4_YOCO": "2",
+    "DS4_MMQ": "1",
+    "DS4_CONVS": "4",
+    "DS4_ENGRAM_RAM": "1",
+    "DS4_COPY_NUMA": "1",
+    "DS4_CKPIN": "1",
+    "GPU_MAX_HW_QUEUES": "4",
+    "STRATA_DS4_RAM_TIER": "0",
+    "STRATA_FAIR_SLICE_S": "2"
+  }
+}

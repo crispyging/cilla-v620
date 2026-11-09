@@ -14,6 +14,8 @@ Upstream source, notices and credits are retained. Upstream installer/update fea
 
 ## Optional four-card recipe — not a universal default
 
+For a copyable HTTP launch command and a ready-to-edit config containing these values, see [Launching Cilla](LAUNCHING.md#four-v620-reference-profile-opt-in-high-host-ram-use).
+
 The following settings describe the original four-card layer-split recipe. They require a compatible 40-layer DeepSeek pack, ample physical host RAM and adequate locked-memory limits. Do **not** apply them to one/two-card machines or assume a 512K context was exhaustively qualified. Increase context only after memory admission and output tests.
 
 ```

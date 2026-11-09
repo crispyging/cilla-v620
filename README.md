@@ -68,6 +68,8 @@ Use modest parallelism initially. CMake applies MMQ fused-SwiGLU and byte-stride
 
 ## Pack and serve
 
+**Copyable launch commands:** [Launching Cilla](docs/LAUNCHING.md) covers the HTTP server, a separate opt-in four-V620 reference config, the engine-only protocol command, and eight-card adaptation caveats. It does not require any private deployment launcher.
+
 The command below is an example for a complete, supported `deepseek41` GGUF set, **not a guaranteed recipe for arbitrary GGUFs**. A versioned family example is [Maya-S at revision `758b04c62d2572f4381d067b32d4686a1c4275b3`](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/758b04c62d2572f4381d067b32d4686a1c4275b3/Maya-S): six `DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-...gguf` shards. This pins artifact identity, not a fresh qualification of that checkpoint on your hardware. Keep all shards from the same revision; check their model license and memory requirements separately.
 
 See `tools/ds4/pack_gguf.py --help` and upstream DeepSeek docs. A text-only pack without a drafter must explicitly opt out of sibling sidecar discovery:
